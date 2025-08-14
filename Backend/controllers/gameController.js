@@ -69,53 +69,7 @@ const makeMove = async (req, res) => {
       match.status = 'completed';
 
       // Update player stats
-      if (gameResult.winner !== 'tie') {
-        const winnerAddress = match.winner;
-        const loserAddress = match.winner === match.player1 ? match.player2 : match.player1;
-
-        await Promise.all([
-          Player.findOneAndUpdate(
-            { address: winnerAddress },
-            { 
-              $inc: { 
-                totalWins: 1, 
-                totalEarnings: parseFloat(match.stakeAmount) * 2,
-                currentStreak: 1
-              },
-              $max: { bestStreak: 1 },
-              lastActive: new Date()
-            }
-          ),
-          Player.findOneAndUpdate(
-            { address: loserAddress },
-            { 
-              $inc: { 
-                totalLosses: 1,
-                currentStreak: 0
-              },
-              lastActive: new Date()
-            }
-          )
-        ]);
-      } else {
-        // Handle tie - both players get their stake back
-        await Promise.all([
-          Player.findOneAndUpdate(
-            { address: match.player1 },
-            { 
-              $inc: { totalTies: 1 },
-              lastActive: new Date()
-            }
-          ),
-          Player.findOneAndUpdate(
-            { address: match.player2 },
-            { 
-              $inc: { totalTies: 1 },
-              lastActive: new Date()
-            }
-          )
-        ]);
-      }
+      await updatePlayerStats(match, gameResult.winner);
     } else {
       // Switch turns
       match.currentPlayer = match.currentPlayer === match.player1 ? match.player2 : match.player1;
@@ -123,16 +77,61 @@ const makeMove = async (req, res) => {
 
     await match.save();
 
-    // Broadcast move to other player
+    // Get Socket.IO instance for real-time updates
     const io = req.app.get('socketio');
+
+    // Broadcast move to all players in the match
     io.to(matchId).emit('moveUpdate', {
       matchId,
       board: newBoard,
       currentPlayer: match.currentPlayer,
       gameState: match.gameState,
       winner: match.winner,
-      moveCount: match.moveCount
+      moveCount: match.moveCount,
+      lastMove: {
+        player: player.toLowerCase(),
+        position,
+        symbol: playerSymbol
+      }
     });
+
+    // If game ended, send special end game notification
+    if (gameResult.winner) {
+      io.to(matchId).emit('gameEnded', {
+        matchId,
+        winner: match.winner,
+        gameState: match.gameState,
+        finalBoard: newBoard,
+        winningLine: gameResult.winningLine
+      });
+
+      // Notify players individually about results
+      if (gameResult.winner !== 'tie') {
+        const winnerAddress = match.winner;
+        const loserAddress = match.winner === match.player1 ? match.player2 : match.player1;
+        
+        io.to(`user_${winnerAddress}`).emit('gameResult', {
+          matchId,
+          result: 'win',
+          earnings: parseFloat(match.stakeAmount) * 2
+        });
+        
+        io.to(`user_${loserAddress}`).emit('gameResult', {
+          matchId,
+          result: 'loss'
+        });
+      } else {
+        // Notify both players about tie
+        io.to(`user_${match.player1}`).emit('gameResult', {
+          matchId,
+          result: 'tie'
+        });
+        io.to(`user_${match.player2}`).emit('gameResult', {
+          matchId,
+          result: 'tie'
+        });
+      }
+    }
 
     res.json({
       success: true,
@@ -140,12 +139,79 @@ const makeMove = async (req, res) => {
       gameState: match.gameState,
       winner: match.winner,
       currentPlayer: match.currentPlayer,
-      moveCount: match.moveCount
+      moveCount: match.moveCount,
+      isGameEnded: !!gameResult.winner
     });
 
   } catch (error) {
     console.error('Error making move:', error);
     res.status(500).json({ message: 'Internal server error' });
+  }
+};
+
+// Helper function to update player stats
+const updatePlayerStats = async (match, winner) => {
+  try {
+    if (winner === 'tie') {
+      // Handle tie - both players get their stake back
+      await Promise.all([
+        Player.findOneAndUpdate(
+          { address: match.player1 },
+          { 
+            $inc: { totalTies: 1 },
+            $set: { currentStreak: 0 },
+            lastActive: new Date()
+          }
+        ),
+        Player.findOneAndUpdate(
+          { address: match.player2 },
+          { 
+            $inc: { totalTies: 1 },
+            $set: { currentStreak: 0 },
+            lastActive: new Date()
+          }
+        )
+      ]);
+    } else {
+      const winnerAddress = match.winner;
+      const loserAddress = match.winner === match.player1 ? match.player2 : match.player1;
+
+      // Update winner stats
+      const winnerPlayer = await Player.findOne({ address: winnerAddress });
+      const newWinStreak = (winnerPlayer?.currentStreak || 0) + 1;
+      const bestStreak = Math.max(winnerPlayer?.bestStreak || 0, newWinStreak);
+
+      await Promise.all([
+        Player.findOneAndUpdate(
+          { address: winnerAddress },
+          { 
+            $inc: { 
+              totalWins: 1, 
+              totalEarnings: parseFloat(match.stakeAmount) * 2
+            },
+            $set: {
+              currentStreak: newWinStreak,
+              bestStreak: bestStreak
+            },
+            lastActive: new Date()
+          }
+        ),
+        Player.findOneAndUpdate(
+          { address: loserAddress },
+          { 
+            $inc: { 
+              totalLosses: 1
+            },
+            $set: {
+              currentStreak: 0
+            },
+            lastActive: new Date()
+          }
+        )
+      ]);
+    }
+  } catch (error) {
+    console.error('Error updating player stats:', error);
   }
 };
 
@@ -159,6 +225,11 @@ const getGameState = async (req, res) => {
       return res.status(404).json({ message: 'Match not found' });
     }
 
+    // Get recent moves for context
+    const recentMoves = await GameMove.find({ matchId })
+      .sort({ moveNumber: -1 })
+      .limit(5);
+
     res.json({
       matchId: match.matchId,
       board: match.board,
@@ -168,7 +239,11 @@ const getGameState = async (req, res) => {
       moveCount: match.moveCount,
       player1: match.player1,
       player2: match.player2,
-      stakeAmount: match.stakeAmount
+      stakeAmount: match.stakeAmount,
+      status: match.status,
+      startedAt: match.startedAt,
+      lastMoveAt: match.lastMoveAt,
+      recentMoves: recentMoves.reverse() // Show in chronological order
     });
 
   } catch (error) {
@@ -202,6 +277,14 @@ const submitResult = async (req, res) => {
 
     await match.save();
 
+    // Notify players about blockchain settlement
+    const io = req.app.get('socketio');
+    io.to(match.matchId).emit('blockchainSettled', {
+      matchId,
+      txHash,
+      winner: match.winner
+    });
+
     res.json({ message: 'Result submitted successfully' });
 
   } catch (error) {
@@ -218,7 +301,14 @@ const getGameHistory = async (req, res) => {
     const moves = await GameMove.find({ matchId })
       .sort({ moveNumber: 1 });
 
-    res.json(moves);
+    const match = await Match.findOne({ matchId })
+      .select('player1 player2 winner gameState status');
+
+    res.json({
+      match,
+      moves,
+      totalMoves: moves.length
+    });
 
   } catch (error) {
     console.error('Error fetching game history:', error);
@@ -285,6 +375,9 @@ const handleMove = async (data) => {
                     (gameResult.winner === 'X' ? match.player1 : match.player2);
       match.endedAt = new Date();
       match.status = 'completed';
+
+      // Update player stats
+      await updatePlayerStats(match, gameResult.winner);
     } else {
       match.currentPlayer = match.currentPlayer === match.player1 ? match.player2 : match.player1;
     }
@@ -296,7 +389,8 @@ const handleMove = async (data) => {
       board: newBoard,
       gameState: match.gameState,
       winner: match.winner,
-      currentPlayer: match.currentPlayer
+      currentPlayer: match.currentPlayer,
+      winningLine: gameResult.winningLine
     };
 
   } catch (error) {
@@ -305,10 +399,58 @@ const handleMove = async (data) => {
   }
 };
 
+// Forfeit/abandon game
+const forfeitGame = async (req, res) => {
+  try {
+    const { matchId, player } = req.body;
+
+    const match = await Match.findOne({ matchId });
+    if (!match) {
+      return res.status(404).json({ message: 'Match not found' });
+    }
+
+    if (match.gameState !== 'ongoing') {
+      return res.status(400).json({ message: 'Game is not active' });
+    }
+
+    if (match.player1 !== player.toLowerCase() && match.player2 !== player.toLowerCase()) {
+      return res.status(403).json({ message: 'Not authorized for this match' });
+    }
+
+    // Determine winner (the other player)
+    const winner = match.player1 === player.toLowerCase() ? match.player2 : match.player1;
+    
+    match.winner = winner;
+    match.gameState = 'finished';
+    match.status = 'completed';
+    match.endedAt = new Date();
+
+    await match.save();
+
+    // Update player stats
+    await updatePlayerStats(match, winner === match.player1 ? 'X' : 'O');
+
+    // Notify both players
+    const io = req.app.get('socketio');
+    io.to(matchId).emit('gameForfeited', {
+      matchId,
+      forfeitedBy: player.toLowerCase(),
+      winner
+    });
+
+    res.json({ message: 'Game forfeited successfully' });
+
+  } catch (error) {
+    console.error('Error forfeiting game:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+};
+
 module.exports = {
   makeMove,
   getGameState,
   submitResult,
   getGameHistory,
-  handleMove
+  handleMove,
+  forfeitGame
 };

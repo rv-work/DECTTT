@@ -2,17 +2,114 @@ import React, { useState, useEffect } from "react";
 import { useWeb3 } from "../context/Web3Context";
 import toast from "react-hot-toast";
 import axios from "axios";
+import io from "socket.io-client"; // Make sure to install: npm install socket.io-client
 
 const Play = () => {
   const { account, balances, joinMatch, createMatch, loading } = useWeb3();
-  const [activeTab, setActiveTab] = useState("create"); // 'create' or 'join'
+  const [activeTab, setActiveTab] = useState("create");
   const [stakeAmount, setStakeAmount] = useState("");
   const [availableMatches, setAvailableMatches] = useState([]);
   const [currentMatch, setCurrentMatch] = useState(null);
   const [gameBoard, setGameBoard] = useState(Array(9).fill(""));
   const [isPlayerTurn, setIsPlayerTurn] = useState(false);
   const [playerSymbol, setPlayerSymbol] = useState("");
-  const [gameResult, setGameResult] = useState(null); // 'win', 'lose', 'tie', or null
+  const [gameResult, setGameResult] = useState(null);
+  const [socket, setSocket] = useState(null);
+  const [waitingForOpponent, setWaitingForOpponent] = useState(false);
+
+  // Initialize Socket.IO connection
+  useEffect(() => {
+    if (account) {
+      const newSocket = io("http://localhost:5000");
+      setSocket(newSocket);
+
+      // Join user-specific room for notifications
+      newSocket.emit("joinUserRoom", account);
+
+      // Listen for match events
+      newSocket.on("matchJoined", (data) => {
+        console.log("Match joined:", data);
+        if (data.player1 === account.toLowerCase()) {
+          // Someone joined your match
+          toast.success(`Player joined your match!`);
+          setCurrentMatch(data);
+          setPlayerSymbol("X"); // Creator is X
+          setIsPlayerTurn(true); // X goes first
+          setGameBoard(Array(9).fill(""));
+          setWaitingForOpponent(false);
+          setGameResult(null);
+        }
+      });
+
+      // Listen for move updates
+      newSocket.on("moveUpdate", (data) => {
+        console.log("Move update received:", data);
+        setGameBoard(data.board);
+        setCurrentMatch((prev) => ({
+          ...prev,
+          ...data,
+        }));
+
+        // Update turn status
+        if (data.currentPlayer === account.toLowerCase()) {
+          setIsPlayerTurn(true);
+        } else {
+          setIsPlayerTurn(false);
+        }
+
+        // Handle game end
+        if (data.gameState === "finished" || data.gameState === "tie") {
+          if (data.winner === account.toLowerCase()) {
+            setGameResult("win");
+            toast.success("🎉 You won the game!");
+          } else if (data.winner && data.winner !== account.toLowerCase()) {
+            setGameResult("lose");
+            toast.error("😞 You lost the game!");
+          } else {
+            setGameResult("tie");
+            toast.info("🤝 Game ended in a tie!");
+          }
+          setIsPlayerTurn(false);
+        }
+      });
+
+      // Listen for opponent moves
+      newSocket.on("opponentMove", (data) => {
+        console.log("Opponent move:", data);
+        setGameBoard(data.board);
+        setIsPlayerTurn(data.player !== account.toLowerCase());
+      });
+
+      // Listen for game end
+      newSocket.on("gameEnded", (data) => {
+        console.log("Game ended:", data);
+        if (data.winner === account.toLowerCase()) {
+          setGameResult("win");
+          toast.success("🎉 You won!");
+        } else if (data.winner && data.winner !== account.toLowerCase()) {
+          setGameResult("lose");
+          toast.error("😞 You lost!");
+        } else {
+          setGameResult("tie");
+          toast.info("🤝 It's a tie!");
+        }
+        setGameBoard(data.finalBoard);
+        setIsPlayerTurn(false);
+      });
+
+      // Listen for match cancellations
+      newSocket.on("matchCancelled", (data) => {
+        toast.info("Match was cancelled");
+        setCurrentMatch(null);
+        setWaitingForOpponent(false);
+        resetGameState();
+      });
+
+      return () => {
+        newSocket.disconnect();
+      };
+    }
+  }, [account]);
 
   // Fetch available matches
   useEffect(() => {
@@ -29,12 +126,19 @@ const Play = () => {
       }
     };
 
-    if (account) {
+    if (account && !currentMatch && !waitingForOpponent) {
       fetchMatches();
       const interval = setInterval(fetchMatches, 5000);
       return () => clearInterval(interval);
     }
-  }, [account]);
+  }, [account, currentMatch, waitingForOpponent]);
+
+  const resetGameState = () => {
+    setGameBoard(Array(9).fill(""));
+    setIsPlayerTurn(false);
+    setPlayerSymbol("");
+    setGameResult(null);
+  };
 
   const handleCreateMatch = async (e) => {
     e.preventDefault();
@@ -52,6 +156,12 @@ const Play = () => {
       if (matchId) {
         toast.success("Match created! Waiting for opponent...");
         setStakeAmount("");
+        setWaitingForOpponent(true);
+
+        // Join the match room for real-time updates
+        if (socket) {
+          socket.emit("joinMatch", matchId);
+        }
       }
     } catch (error) {
       console.error("Error creating match:", error);
@@ -61,54 +171,113 @@ const Play = () => {
   const handleJoinMatch = async (match) => {
     try {
       await joinMatch(match.matchId, match.stakeAmount);
-      setCurrentMatch(match);
-      setPlayerSymbol("O"); // Joiner is O, creator is X
-      toast.success("Joined match successfully!");
+
+      // Join the match room
+      if (socket) {
+        socket.emit("joinMatch", match.matchId);
+      }
+
+      // Update backend about joining
+      const response = await axios.post(
+        "http://localhost:5000/api/matches/join",
+        {
+          matchId: match.matchId,
+          player2: account,
+        }
+      );
+
+      if (response.data) {
+        setCurrentMatch({
+          ...match,
+          player2: account,
+          status: "active",
+        });
+        setPlayerSymbol("O"); // Joiner is O
+        setIsPlayerTurn(false); // X (creator) goes first
+        setGameBoard(Array(9).fill(""));
+        setGameResult(null);
+        toast.success("Joined match successfully!");
+      }
     } catch (error) {
       console.error("Error joining match:", error);
+      toast.error("Failed to join match");
     }
   };
 
   const handleCellClick = async (index) => {
-    if (!currentMatch || gameBoard[index] !== "" || !isPlayerTurn || gameResult)
+    if (
+      !currentMatch ||
+      gameBoard[index] !== "" ||
+      !isPlayerTurn ||
+      gameResult
+    ) {
       return;
+    }
 
     const newBoard = [...gameBoard];
     newBoard[index] = playerSymbol;
     setGameBoard(newBoard);
     setIsPlayerTurn(false);
 
-    // Check for winner after move
-    const winner = checkWinner(newBoard);
-    if (winner) {
-      if (winner === "tie") {
-        setGameResult("tie");
-        toast.info("Game ended in a tie!");
-      } else if (winner === playerSymbol) {
-        setGameResult("win");
-        toast.success("You won the game!");
-      } else {
-        setGameResult("lose");
-        toast.error("You lost the game!");
-      }
-    }
-
     try {
-      await axios.post("http://localhost:5000/api/game/move", {
+      // Send move to backend
+      const response = await axios.post("http://localhost:5000/api/game/move", {
         matchId: currentMatch.matchId,
         player: account,
         position: index,
         board: newBoard,
-        winner: winner,
       });
+
+      if (response.data.success) {
+        // Update local state with server response
+        setGameBoard(response.data.board);
+
+        if (
+          response.data.gameState === "finished" ||
+          response.data.gameState === "tie"
+        ) {
+          if (response.data.winner === account.toLowerCase()) {
+            setGameResult("win");
+            toast.success("🎉 You won!");
+          } else if (
+            response.data.winner &&
+            response.data.winner !== account.toLowerCase()
+          ) {
+            setGameResult("lose");
+            toast.error("😞 You lost!");
+          } else {
+            setGameResult("tie");
+            toast.info("🤝 It's a tie!");
+          }
+          setIsPlayerTurn(false);
+        }
+
+        // Emit move via socket for real-time update
+        if (socket) {
+          socket.emit("makeMove", {
+            matchId: currentMatch.matchId,
+            player: account,
+            position: index,
+            board: response.data.board,
+          });
+        }
+      }
     } catch (error) {
       console.error("Error making move:", error);
       toast.error("Failed to make move");
       // Revert the move
-      const revertedBoard = [...gameBoard];
-      setGameBoard(revertedBoard);
+      setGameBoard(gameBoard);
       setIsPlayerTurn(true);
-      setGameResult(null);
+    }
+  };
+
+  const handleCancelWait = async () => {
+    try {
+      // Cancel the waiting match
+      setWaitingForOpponent(false);
+      toast.info("Cancelled waiting for opponent");
+    } catch (error) {
+      console.error("Error cancelling match:", error);
     }
   };
 
@@ -116,12 +285,12 @@ const Play = () => {
     const lines = [
       [0, 1, 2],
       [3, 4, 5],
-      [6, 7, 8], // rows
+      [6, 7, 8],
       [0, 3, 6],
       [1, 4, 7],
-      [2, 5, 8], // columns
+      [2, 5, 8],
       [0, 4, 8],
-      [2, 4, 6], // diagonals
+      [2, 4, 6],
     ];
 
     for (let line of lines) {
@@ -147,34 +316,65 @@ const Play = () => {
     </button>
   );
 
-  const MatchCard = ({ match, onJoin }) => (
-    <div className="bg-white/10 backdrop-blur-sm border border-white/20 rounded-xl p-6">
-      <div className="flex items-center justify-between mb-4">
-        <div>
-          <p className="text-white font-semibold">
-            Stake: {parseFloat(match.stakeAmount).toFixed(2)} GT
-          </p>
-          <p className="text-gray-400 text-sm">
-            Player: {match.player1.slice(0, 6)}...{match.player1.slice(-4)}
-          </p>
+  const formatTokenAmount = (amount) => {
+    const formatted = parseFloat(amount) / Math.pow(10, 18);
+    return formatted;
+  };
+
+  const MatchCard = ({ match, onJoin }) => {
+    const stakeInTokens = formatTokenAmount(match.stakeAmount);
+
+    return (
+      <div className="bg-white/10 backdrop-blur-sm border border-white/20 rounded-xl p-6">
+        <div className="flex items-center justify-between mb-4">
+          <div>
+            <p className="text-white font-semibold">
+              Stake: {stakeInTokens.toFixed(2)} GT
+            </p>
+            <p className="text-gray-400 text-sm">
+              Player: {match.player1.slice(0, 6)}...{match.player1.slice(-4)}
+            </p>
+          </div>
+          <div className="text-2xl">🎯</div>
         </div>
-        <div className="text-2xl">🎯</div>
-      </div>
-      <button
-        onClick={() => onJoin(match)}
-        disabled={
-          loading || parseFloat(balances.gt) < parseFloat(match.stakeAmount)
-        }
-        className="w-full bg-gradient-to-r from-green-600 to-blue-600 hover:from-green-700 hover:to-blue-700 
+        <button
+          onClick={() => onJoin(match)}
+          disabled={loading || parseFloat(balances.gt) < stakeInTokens}
+          className="w-full bg-gradient-to-r from-green-600 to-blue-600 hover:from-green-700 hover:to-blue-700 
                  text-white font-bold py-2 px-4 rounded-lg transition-all duration-200 
                  transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed"
-      >
-        {parseFloat(balances.gt) < parseFloat(match.stakeAmount)
-          ? "Insufficient GT"
-          : "Join Match"}
-      </button>
-    </div>
-  );
+        >
+          {parseFloat(balances.gt) < stakeInTokens
+            ? "Insufficient GT"
+            : "Join Match"}
+        </button>
+      </div>
+    );
+  };
+
+  // Waiting for opponent screen
+  if (waitingForOpponent) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-purple-900 via-blue-900 to-indigo-900 flex items-center justify-center">
+        <div className="text-center bg-white/10 backdrop-blur-sm border border-white/20 rounded-2xl p-12">
+          <div className="animate-spin text-6xl mb-6">⏳</div>
+          <h2 className="text-4xl font-bold text-white mb-4">
+            Waiting for Opponent
+          </h2>
+          <p className="text-gray-300 mb-8">
+            Your match has been created. Waiting for someone to join...
+          </p>
+          <div className="animate-pulse text-2xl mb-6">🎯</div>
+          <button
+            onClick={handleCancelWait}
+            className="bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-8 rounded-lg transition-all duration-200"
+          >
+            Cancel Wait
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   if (!account) {
     return (
@@ -239,7 +439,8 @@ const Play = () => {
                   Match In Progress
                 </h2>
                 <p className="text-gray-300">
-                  Stake: {parseFloat(currentMatch.stakeAmount).toFixed(2)} GT
+                  Stake:{" "}
+                  {formatTokenAmount(currentMatch.stakeAmount).toFixed(2)} GT
                   each
                 </p>
                 <p className="text-gray-300">
@@ -262,9 +463,9 @@ const Play = () => {
                         </p>
                         <p className="text-green-300">
                           You earned{" "}
-                          {(parseFloat(currentMatch.stakeAmount) * 2).toFixed(
-                            2
-                          )}{" "}
+                          {(
+                            formatTokenAmount(currentMatch.stakeAmount) * 2
+                          ).toFixed(2)}{" "}
                           GT
                         </p>
                       </div>
@@ -311,10 +512,8 @@ const Play = () => {
                     <button
                       onClick={() => {
                         setCurrentMatch(null);
-                        setGameBoard(Array(9).fill(""));
-                        setPlayerSymbol("");
-                        setIsPlayerTurn(false);
-                        setGameResult(null);
+                        resetGameState();
+                        setWaitingForOpponent(false);
                       }}
                       className="bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 
                                text-white font-bold py-3 px-8 rounded-lg transition-all duration-200 mr-4"
@@ -324,10 +523,8 @@ const Play = () => {
                     <button
                       onClick={() => {
                         setCurrentMatch(null);
-                        setGameBoard(Array(9).fill(""));
-                        setPlayerSymbol("");
-                        setIsPlayerTurn(false);
-                        setGameResult(null);
+                        resetGameState();
+                        setWaitingForOpponent(false);
                       }}
                       className="bg-gray-600 hover:bg-gray-700 text-white font-bold py-3 px-8 rounded-lg transition-all duration-200"
                     >
@@ -338,10 +535,11 @@ const Play = () => {
                   <button
                     onClick={() => {
                       setCurrentMatch(null);
-                      setGameBoard(Array(9).fill(""));
-                      setPlayerSymbol("");
-                      setIsPlayerTurn(false);
-                      setGameResult(null);
+                      resetGameState();
+                      setWaitingForOpponent(false);
+                      if (socket) {
+                        socket.emit("leaveMatch", currentMatch.matchId);
+                      }
                     }}
                     className="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-6 rounded-lg"
                   >

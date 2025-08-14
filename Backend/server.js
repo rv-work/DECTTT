@@ -26,7 +26,11 @@ const io = socketIo(server, {
 });
 
 const PORT = process.env.PORT || 5000;
-const MONGODB_URI = process.env.MONGODB_URI 
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/tictactoe';
+
+// Store user socket mappings
+const userSockets = new Map(); // userId -> socketId
+const socketUsers = new Map(); // socketId -> userId
 
 // Middleware
 app.use(cors());
@@ -52,16 +56,35 @@ mongoose.connect(MONGODB_URI, {
 io.on('connection', (socket) => {
   console.log('👤 User connected:', socket.id);
 
+  // Join user-specific room for notifications
+  socket.on('joinUserRoom', (userId) => {
+    console.log(`🏠 User ${userId} joined their room`);
+    socket.join(`user_${userId.toLowerCase()}`);
+    userSockets.set(userId.toLowerCase(), socket.id);
+    socketUsers.set(socket.id, userId.toLowerCase());
+  });
+
   // Join match room
   socket.on('joinMatch', (matchId) => {
     socket.join(matchId);
     console.log(`🎮 Player ${socket.id} joined match ${matchId}`);
+    
+    // Notify room about player joining
+    socket.to(matchId).emit('playerJoinedRoom', {
+      playerId: socketUsers.get(socket.id),
+      matchId
+    });
   });
 
   // Leave match room
   socket.on('leaveMatch', (matchId) => {
     socket.leave(matchId);
     console.log(`🚪 Player ${socket.id} left match ${matchId}`);
+    
+    socket.to(matchId).emit('playerLeftRoom', {
+      playerId: socketUsers.get(socket.id),
+      matchId
+    });
   });
 
   // Handle game moves
@@ -69,12 +92,15 @@ io.on('connection', (socket) => {
     try {
       const result = await gameController.handleMove(data);
       if (result.success) {
-        // Broadcast move to all players in the match
+        console.log(`🎯 Move made in match ${data.matchId}`);
+        
+        // Broadcast move to all players in the match except sender
         socket.to(data.matchId).emit('opponentMove', {
           position: data.position,
           player: data.player,
           board: result.board,
-          gameState: result.gameState
+          gameState: result.gameState,
+          currentPlayer: result.currentPlayer
         });
 
         // If game ended, notify both players
@@ -94,13 +120,41 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Handle match notifications
+  socket.on('notifyMatchJoined', (data) => {
+    const { player1, matchData } = data;
+    
+    // Notify the match creator that someone joined
+    io.to(`user_${player1.toLowerCase()}`).emit('matchJoined', {
+      ...matchData,
+      message: 'Someone joined your match!'
+    });
+  });
+
+  // Handle disconnection
   socket.on('disconnect', () => {
     console.log('👋 User disconnected:', socket.id);
+    
+    const userId = socketUsers.get(socket.id);
+    if (userId) {
+      userSockets.delete(userId);
+      socketUsers.delete(socket.id);
+    }
   });
 });
 
-// Make io accessible to routes
+// Helper function to notify users
+const notifyUser = (userId, event, data) => {
+  const socketId = userSockets.get(userId.toLowerCase());
+  if (socketId) {
+    io.to(socketId).emit(event, data);
+  }
+};
+
+// Make io and helper functions accessible to routes
 app.set('socketio', io);
+app.set('notifyUser', notifyUser);
+app.set('userSockets', userSockets);
 
 // Routes
 app.use('/api/matches', matchRoutes);
@@ -114,7 +168,8 @@ app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'OK', 
     timestamp: new Date().toISOString(),
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    connectedUsers: userSockets.size
   });
 });
 

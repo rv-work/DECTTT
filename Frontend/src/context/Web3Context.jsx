@@ -242,6 +242,7 @@ export const Web3Provider = ({ children }) => {
         }
       });
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Update balances when account changes

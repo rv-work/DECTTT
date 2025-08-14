@@ -110,6 +110,7 @@ const joinMatch = async (req, res) => {
     }
 
     // Update match
+    const originalPlayer1 = match.player1;
     match.player2 = player2.toLowerCase();
     match.status = 'active';
     match.gameState = 'ongoing';
@@ -138,24 +139,42 @@ const joinMatch = async (req, res) => {
       )
     ]);
 
-    // Notify players that match has started
+    // Get Socket.IO instance and notification helper
     const io = req.app.get('socketio');
+    const notifyUser = req.app.get('notifyUser');
+
+    // Notify the match creator that someone joined their match
+    console.log(`🔔 Notifying player1 ${originalPlayer1} about match join`);
+    
+    const matchData = {
+      matchId: match.matchId,
+      player1: match.player1,
+      player2: match.player2,
+      stakeAmount: match.stakeAmount,
+      status: match.status,
+      gameState: match.gameState,
+      board: match.board,
+      currentPlayer: match.currentPlayer
+    };
+
+    // Notify via user-specific room
+    io.to(`user_${originalPlayer1.toLowerCase()}`).emit('matchJoined', matchData);
+    
+    // Also notify the match room
     io.to(matchId).emit('matchStarted', {
       matchId: match.matchId,
       player1: match.player1,
       player2: match.player2,
-      currentPlayer: match.currentPlayer
+      currentPlayer: match.currentPlayer,
+      gameState: match.gameState
     });
+
+    // Remove match from available matches list
+    io.emit('matchUnavailable', { matchId });
 
     res.json({
       message: 'Successfully joined match',
-      match: {
-        matchId: match.matchId,
-        player1: match.player1,
-        player2: match.player2,
-        status: match.status,
-        gameState: match.gameState
-      }
+      match: matchData
     });
 
   } catch (error) {
@@ -251,11 +270,61 @@ const cancelMatch = async (req, res) => {
     // Notify other player if exists
     const io = req.app.get('socketio');
     io.to(matchId).emit('matchCancelled', { matchId });
+    
+    // Notify both players individually
+    if (match.player1) {
+      io.to(`user_${match.player1}`).emit('matchCancelled', { matchId });
+    }
+    if (match.player2) {
+      io.to(`user_${match.player2}`).emit('matchCancelled', { matchId });
+    }
+
+    // Remove from available matches if it was waiting
+    if (match.status === 'waiting') {
+      io.emit('matchUnavailable', { matchId });
+    }
 
     res.json({ message: 'Match cancelled successfully' });
 
   } catch (error) {
     console.error('Error cancelling match:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+};
+
+// Get current match status for a player
+const getCurrentMatch = async (req, res) => {
+  try {
+    const { address } = req.params;
+
+    const currentMatch = await Match.findOne({
+      $or: [
+        { player1: address.toLowerCase() },
+        { player2: address.toLowerCase() }
+      ],
+      status: { $in: ['waiting', 'active'] }
+    }).sort({ createdAt: -1 });
+
+    if (!currentMatch) {
+      return res.json({ match: null });
+    }
+
+    // Determine player's symbol and turn status
+    const isPlayer1 = currentMatch.player1 === address.toLowerCase();
+    const playerSymbol = isPlayer1 ? 'X' : 'O';
+    const isPlayerTurn = currentMatch.currentPlayer === address.toLowerCase();
+
+    res.json({
+      match: {
+        ...currentMatch.toObject(),
+        playerSymbol,
+        isPlayerTurn,
+        isPlayer1
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching current match:', error);
     res.status(500).json({ message: 'Internal server error' });
   }
 };
@@ -266,5 +335,6 @@ module.exports = {
   joinMatch,
   getMatchById,
   getUserMatches,
-  cancelMatch
+  cancelMatch,
+  getCurrentMatch
 };
