@@ -1,0 +1,39 @@
+{
+  "name": "decentralized-tic-tac-toe",
+  "version": "1.0.0",
+  "description": "A blockchain-based Tic Tac Toe game with staking and payouts",
+  "main": "server.js",
+  "scripts": {
+    "dev": "concurrently \"npm run hardhat\" \"npm run server\" \"npm run leaderboard\"",
+    "hardhat": "npx hardhat node",
+    "deploy": "npx hardhat run scripts/deploy.js --network localhost",
+    "server": "nodemon server.js",
+    "leaderboard": "nodemon leaderboard.js",
+    "test": "npx hardhat test",
+    "compile": "npx hardhat compile",
+    "clean": "npx hardhat clean",
+    "frontend": "npm start",
+    "build": "npm run compile"
+  },
+  "keywords": [
+    "blockchain",
+    "ethereum",
+    "smart-contracts",
+    "tic-tac-toe",
+    "gaming",
+    "web3"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^6.1.0",
+    "dotenv": "^17.2.1",
+    "hardhat": "^2.26.3"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.4.0"
+  }
+}

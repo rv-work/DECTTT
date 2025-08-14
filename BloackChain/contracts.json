@@ -1,0 +1,10 @@
+{
+  "mockUSDT": "0x6BABe4703b06fa62602Fe4e470fde43DdbdE66b0",
+  "gameToken": "0x66F46D274A186DCd1E13e8ad598184b20910FC69",
+  "tokenStore": "0x5E581B8C44F0ec1f86b68A1E23342432311e6e15",
+  "playGame": "0xdb17725A2353F5da589294A4b965Ccb41715AA0C",
+  "network": {
+    "name": "sepolia",
+    "chainId": "11155111"
+  }
+}
